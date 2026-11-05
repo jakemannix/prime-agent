@@ -158,6 +158,19 @@ export const PUBLIC_COMMAND_NAMES = new Set(
 
 export const REMOVED_COMMAND_NAMES = new Set(["app", "daemon", "install", "manage", "remove", "uninstall"]);
 
+const CONTEXT_EDITING_ENABLE_FLAGS = new Set([
+	"--context-editing",
+	"--context-editing-dir",
+	"--context-editing-max-prompt-tokens",
+	"--context-editing-fixed-prompt-tokens",
+	"--context-editing-max-output-tokens",
+]);
+
+/** True when raw CLI arguments contain any recognized flag that enables context editing. */
+export function hasContextEditingCliFlag(args: readonly string[]): boolean {
+	return args.some((arg) => CONTEXT_EDITING_ENABLE_FLAGS.has(arg));
+}
+
 type TopLevelOption = readonly [option: string, summary: string];
 
 const TOP_LEVEL_OPTION_GROUPS: ReadonlyArray<{ heading: string; options: readonly TopLevelOption[] }> = [
@@ -209,6 +222,11 @@ const TOP_LEVEL_OPTION_GROUPS: ReadonlyArray<{ heading: string; options: readonl
 			["--theme <path>", "Load a theme (repeatable)"],
 			["--no-themes", "Disable theme discovery"],
 			["-nc, --no-context-files", "Disable AGENTS.md and CLAUDE.md discovery"],
+			["--context-editing", "Enable experimental durable single-root context editing (local runtime only)"],
+			["--context-editing-dir <path>", "Set the session-owned context controller directory"],
+			["--context-editing-max-prompt-tokens <n>", "Set the effective prompt budget"],
+			["--context-editing-fixed-prompt-tokens <n>", "Reserve conservative fixed prompt/tool overhead"],
+			["--context-editing-max-output-tokens <n>", "Reserve output tokens in the effective prompt budget"],
 		],
 	},
 	{

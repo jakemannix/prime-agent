@@ -229,9 +229,15 @@ export function shouldUseDaemonClientRuntime(
 	options: DaemonClientStartupDecision & {
 		ownedSessionWorker?: boolean;
 		hasProcessLocalExtensionFactories?: boolean;
+		forceLocal?: boolean;
 	},
 ): boolean {
-	return shouldUseDaemonClient(options) && !options.ownedSessionWorker && !options.hasProcessLocalExtensionFactories;
+	return (
+		shouldUseDaemonClient(options) &&
+		!options.ownedSessionWorker &&
+		!options.hasProcessLocalExtensionFactories &&
+		!options.forceLocal
+	);
 }
 
 export function shouldEnsureInteractiveDaemonForStartup(
@@ -417,6 +423,7 @@ function validateForkFlags(parsed: Args): void {
 	if (!parsed.fork) return;
 
 	const conflictingFlags = [
+		parsed.contextEditing ? "--context-editing" : undefined,
 		parsed.continue ? "--continue" : undefined,
 		parsed.resume ? "--resume" : undefined,
 		parsed.noSession ? "--no-session" : undefined,
@@ -1065,6 +1072,10 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("parseArgs");
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY);
+	if (parsed.contextEditing && appMode === "daemon") {
+		console.error(chalk.red("Error: --context-editing uses a local in-process runtime and cannot start a daemon."));
+		process.exit(1);
+	}
 
 	if (shouldRejectNonInteractiveAttach(publicCommand.attachAgent, appMode)) {
 		console.error(chalk.red("Error: attach requires an interactive terminal"));
@@ -1144,6 +1155,7 @@ export async function main(args: string[], options?: MainOptions) {
 		listModels: parsed.listModels,
 		ownedSessionWorker: isOwnedSessionWorkerProcess(),
 		hasProcessLocalExtensionFactories,
+		forceLocal: parsed.contextEditing === true,
 	});
 	const useDaemonInteractive = useDaemonClient && appMode === "interactive";
 
@@ -1265,6 +1277,17 @@ export async function main(args: string[], options?: MainOptions) {
 			sessionManager,
 			sessionStartEvent,
 			...resolvedSessionOptions,
+			contextEditing:
+				parsed.contextEditing && (runtimeSessionOptions?.rlmDepth ?? 0) === 0
+					? {
+							directory: parsed.contextEditingDir
+								? resolve(cwd, expandTildePath(parsed.contextEditingDir))
+								: undefined,
+							maxPromptTokens: parsed.contextEditingMaxPromptTokens,
+							fixedPromptTokens: parsed.contextEditingFixedPromptTokens,
+							maxOutputTokens: parsed.contextEditingMaxOutputTokens,
+						}
+					: undefined,
 			// Main agents boot their kernel in the background at session creation;
 			// subagent sessions (rlmDepth > 0) keep the lazy first-call start.
 			prewarmIpythonKernel: true,

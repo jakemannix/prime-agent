@@ -39,6 +39,11 @@ export interface Args {
 	themes?: string[];
 	noThemes?: boolean;
 	noContextFiles?: boolean;
+	contextEditing?: boolean;
+	contextEditingDir?: string;
+	contextEditingMaxPromptTokens?: number;
+	contextEditingFixedPromptTokens?: number;
+	contextEditingMaxOutputTokens?: number;
 	autonomous?: boolean;
 	autonomousGates?: string[];
 	autonomousGateRetries?: number;
@@ -221,6 +226,26 @@ export function parseArgs(args: string[]): Args {
 			result.noThemes = true;
 		} else if (arg === "--no-context-files" || arg === "-nc") {
 			result.noContextFiles = true;
+		} else if (arg === "--context-editing") {
+			result.contextEditing = true;
+		} else if (arg === "--context-editing-dir") {
+			result.contextEditing = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) result.contextEditingDir = args[++i];
+		} else if (arg === "--context-editing-max-prompt-tokens") {
+			result.contextEditing = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.contextEditingMaxPromptTokens = parsePositiveInt(args[++i], arg, result);
+			}
+		} else if (arg === "--context-editing-fixed-prompt-tokens") {
+			result.contextEditing = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.contextEditingFixedPromptTokens = parsePositiveInt(args[++i], arg, result);
+			}
+		} else if (arg === "--context-editing-max-output-tokens") {
+			result.contextEditing = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.contextEditingMaxOutputTokens = parsePositiveInt(args[++i], arg, result);
+			}
 		} else if (arg === "--autonomous") {
 			result.autonomous = true;
 		} else if (arg === "--autonomous-gate") {

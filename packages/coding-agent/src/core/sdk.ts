@@ -1,4 +1,5 @@
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { join, resolve } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { clampThinkingLevel, type Message, type Model, streamSimple, supportsFastMode } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.js";
@@ -7,6 +8,8 @@ import type { AgentSessionCreationOptions } from "./agent-session-services.js";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
 import { AuthStorage } from "./auth-storage.js";
 import type { AgentAutonomousConfig } from "./autonomous.js";
+import { ContextEditingController, canonicalJson, type RequestSnapshot } from "./context-editing/index.js";
+import { applySglangContextMetadata, validateSglangEndpoint } from "./context-editing/sglang-adapter.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { McpManager } from "./mcp/mcp-manager.js";
@@ -88,7 +91,7 @@ export interface CreateAgentSessionResult {
 
 export type { AgentSessionRuntimeConfig } from "./agent-session-config.js";
 export * from "./agent-session-runtime.js";
-export type { AgentSessionCreationOptions } from "./agent-session-services.js";
+export type { AgentSessionCreationOptions, ContextEditingSessionOptions } from "./agent-session-services.js";
 export type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -248,12 +251,86 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const serviceTier =
 		serviceTierPreference === "priority" && (!model || !supportsFastMode(model)) ? "default" : serviceTierPreference;
 
+	let contextEditingController: ContextEditingController | undefined;
+	let contextEditingControllerOptions: ConstructorParameters<typeof ContextEditingController>[0] | undefined;
+	if (options.contextEditing) {
+		if ((options.rlmDepth ?? 0) !== 0) {
+			throw new Error("Context editing is supported only for a root AgentSession.");
+		}
+		if (!model) {
+			throw new Error("Context editing requires a selected model.");
+		}
+		const unsupportedEntry = sessionManager
+			.getBranch()
+			.find((entry) => entry.type === "compaction" || entry.type === "branch_summary");
+		if (unsupportedEntry) {
+			throw new Error(
+				"Context editing cannot open a session that already contains compaction or branch-summary entries.",
+			);
+		}
+		const directory = options.contextEditing.directory
+			? resolve(cwd, options.contextEditing.directory)
+			: sessionManager.getSessionFile()
+				? `${sessionManager.getSessionFile()}.context-editing`
+				: undefined;
+		if (!directory) {
+			throw new Error("Context editing on an in-memory session requires an explicit durable directory.");
+		}
+		if (options.contextEditing.sglang) {
+			const sglang = options.contextEditing.sglang;
+			validateSglangEndpoint(sglang);
+			if (!sglang.model) {
+				throw new Error("SGLang context metadata requires an explicit configured model.");
+			}
+			if (model.api !== "openai-completions") {
+				throw new Error("SGLang context metadata requires the openai-completions API.");
+			}
+			if (new URL(model.baseUrl).href.replace(/\/$/, "") !== new URL(sglang.baseUrl).href.replace(/\/$/, "")) {
+				throw new Error("The selected model endpoint does not match the configured SGLang endpoint.");
+			}
+			if (model.id !== sglang.model) {
+				throw new Error("The selected model does not match the configured SGLang model.");
+			}
+		}
+		contextEditingControllerOptions = {
+			sessionId: sessionManager.getSessionId(),
+			directory,
+			maxPromptTokens: Math.min(options.contextEditing.maxPromptTokens ?? model.contextWindow, model.contextWindow),
+			fixedPromptTokens: options.contextEditing.fixedPromptTokens ?? 0,
+			maxOutputTokens: Math.min(options.contextEditing.maxOutputTokens ?? model.maxTokens, model.maxTokens),
+		};
+	}
+
+	const contextEditingBudget =
+		contextEditingControllerOptions && model
+			? {
+					maxPromptTokens: Math.min(
+						options.contextEditing?.maxPromptTokens ?? model.contextWindow,
+						model.contextWindow,
+					),
+					fixedPromptTokens: options.contextEditing?.fixedPromptTokens ?? 0,
+					maxOutputTokens: Math.min(options.contextEditing?.maxOutputTokens ?? model.maxTokens, model.maxTokens),
+				}
+			: undefined;
 	const allowedToolNames = options.allowedToolNames ?? options.tools ?? (options.noTools === "all" ? [] : undefined);
 	const includeGoals = options.includeGoals ?? (options.tools !== undefined || options.noTools !== "all");
 	const initialActiveToolNames: string[] =
 		options.initialActiveToolNames ?? (options.tools ? [...options.tools] : options.noTools ? [] : ["ipython"]);
 
+	const contextEditingSglang = options.contextEditing?.sglang
+		? Object.freeze({
+				...options.contextEditing.sglang,
+				allowedHosts: options.contextEditing.sglang.allowedHosts
+					? Object.freeze([...options.contextEditing.sglang.allowedHosts])
+					: undefined,
+			})
+		: undefined;
+	const contextEditingMaxOutputTokens = contextEditingControllerOptions
+		? Math.min(options.contextEditing?.maxOutputTokens ?? model!.maxTokens, model!.maxTokens)
+		: undefined;
 	let agent: Agent;
+	let session: AgentSession;
+	let pendingContextRequest: { snapshot: RequestSnapshot; requestId: string } | undefined;
 
 	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
@@ -294,116 +371,188 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
-	agent = new Agent({
-		initialState: {
-			systemPrompt: "",
-			model,
-			thinkingLevel,
-			serviceTier,
-			tools: [],
-		},
-		convertToLlm: convertToLlmWithBlockImages,
-		streamFn: async (model, context, options) => {
-			const auth = await modelRegistry.getApiKeyAndHeaders(model);
-			if (!auth.ok) {
-				throw new Error(auth.error);
-			}
-			const providerRetrySettings = settingsManager.getProviderRetrySettings();
-			return streamSimple(model, context, {
-				...options,
-				apiKey: auth.apiKey,
-				timeoutMs: options?.timeoutMs ?? providerRetrySettings.timeoutMs,
-				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
-				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-				headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
-			});
-		},
-		onPayload: async (payload, _model) => {
-			const runner = extensionRunnerRef.current;
-			if (!runner?.hasHandlers("before_provider_request")) {
-				return payload;
-			}
-			return runner.emitBeforeProviderRequest(payload);
-		},
-		onResponse: async (response, _model) => {
-			const runner = extensionRunnerRef.current;
-			if (!runner?.hasHandlers("after_provider_response")) {
-				return;
-			}
-			await runner.emit({
-				type: "after_provider_response",
-				status: response.status,
-				headers: response.headers,
-			});
-		},
-		sessionId: sessionManager.getSessionId(),
-		transformContext: async (messages) => {
-			const runner = extensionRunnerRef.current;
-			if (!runner) return messages;
-			return runner.emitContext(messages);
-		},
-		steeringMode: settingsManager.getSteeringMode(),
-		followUpMode: settingsManager.getFollowUpMode(),
-		transport: settingsManager.getTransport(),
-		thinkingBudgets: settingsManager.getThinkingBudgets(),
-		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
-	});
+	try {
+		if (contextEditingControllerOptions) {
+			contextEditingController = new ContextEditingController(contextEditingControllerOptions);
+		}
+		agent = new Agent({
+			initialState: {
+				systemPrompt: "",
+				model,
+				thinkingLevel,
+				serviceTier,
+				tools: [],
+			},
+			convertToLlm: convertToLlmWithBlockImages,
+			streamFn: async (model, context, options) => {
+				const auth = await modelRegistry.getApiKeyAndHeaders(model);
+				if (!auth.ok) {
+					throw new Error(auth.error);
+				}
+				const providerRetrySettings = settingsManager.getProviderRetrySettings();
+				return streamSimple(model, context, {
+					...options,
+					...(contextEditingMaxOutputTokens !== undefined
+						? { maxTokens: Math.min(options?.maxTokens ?? model.maxTokens, contextEditingMaxOutputTokens) }
+						: {}),
+					apiKey: auth.apiKey,
+					timeoutMs: options?.timeoutMs ?? providerRetrySettings.timeoutMs,
+					maxRetries:
+						contextEditingSglang !== undefined ? 0 : (options?.maxRetries ?? providerRetrySettings.maxRetries),
+					maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+					headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
+				});
+			},
+			onPayload: async (payload, actualModel) => {
+				const runner = extensionRunnerRef.current;
+				let finalPayload = payload;
+				const pinnedPayload = contextEditingController ? structuredClone(payload) : undefined;
+				if (runner?.hasHandlers("before_provider_request")) {
+					finalPayload = await runner.emitBeforeProviderRequest(finalPayload);
+				}
+				if (!contextEditingController) {
+					return finalPayload;
+				}
+				if (canonicalJson(finalPayload) !== canonicalJson(pinnedPayload)) {
+					pendingContextRequest = undefined;
+					throw new Error(
+						"A before_provider_request extension mutated the pinned context-editing payload; provider dispatch blocked.",
+					);
+				}
+				const pinned = pendingContextRequest;
+				pendingContextRequest = undefined;
+				if (!pinned) {
+					throw new Error("Context editing request metadata is missing; provider dispatch blocked.");
+				}
+				const sglang = contextEditingSglang;
+				if (!sglang) {
+					return finalPayload;
+				}
+				if (actualModel.api !== "openai-completions") {
+					throw new Error("SGLang context metadata requires the openai-completions API.");
+				}
+				const actualEndpoint = new URL(actualModel.baseUrl).href.replace(/\/$/, "");
+				const configuredEndpoint = new URL(sglang.baseUrl).href.replace(/\/$/, "");
+				if (actualEndpoint !== configuredEndpoint) {
+					throw new Error("The active model endpoint does not match the configured SGLang endpoint.");
+				}
+				if (sglang.model !== undefined && actualModel.id !== sglang.model) {
+					throw new Error("The active model does not match the configured SGLang model.");
+				}
+				return applySglangContextMetadata(
+					finalPayload,
+					{
+						sessionId: sessionManager.getSessionId(),
+						cacheEpoch: pinned.snapshot.cacheEpoch,
+						revision: pinned.snapshot.revision,
+						requestId: pinned.requestId,
+					},
+					sglang,
+				);
+			},
+			onResponse: async (response, _model) => {
+				const runner = extensionRunnerRef.current;
+				if (!runner?.hasHandlers("after_provider_response")) {
+					return;
+				}
+				await runner.emit({
+					type: "after_provider_response",
+					status: response.status,
+					headers: response.headers,
+				});
+			},
+			sessionId: sessionManager.getSessionId(),
+			transformContext: async (messages) => {
+				if (!contextEditingController) {
+					const runner = extensionRunnerRef.current;
+					if (!runner) return messages;
+					return runner.emitContext(messages);
+				}
+				pendingContextRequest = undefined;
+				const snapshot = await session.prepareContextEditingRequest();
+				pendingContextRequest = { snapshot, requestId: randomUUID() };
+				return structuredClone(snapshot.messages) as AgentMessage[];
+			},
+			steeringMode: settingsManager.getSteeringMode(),
+			followUpMode: settingsManager.getFollowUpMode(),
+			transport: settingsManager.getTransport(),
+			thinkingBudgets: settingsManager.getThinkingBudgets(),
+			maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+		});
 
-	// Restore messages if session has existing data
-	if (hasExistingSession) {
-		agent.state.messages = existingSession.messages;
-		if (!hasThinkingEntry) {
+		// Restore messages if session has existing data
+		if (hasExistingSession) {
+			agent.state.messages = existingSession.messages;
+			if (!hasThinkingEntry) {
+				sessionManager.appendThinkingLevelChange(thinkingLevel);
+			}
+		} else {
+			// Save initial configuration for new sessions so it can be restored on resume.
+			if (model) {
+				sessionManager.appendModelChange(model.provider, model.id);
+			}
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}
-	} else {
-		// Save initial configuration for new sessions so it can be restored on resume.
-		if (model) {
-			sessionManager.appendModelChange(model.provider, model.id);
+		if (!hasServiceTierEntry) {
+			sessionManager.appendServiceTierChange(serviceTierPreference);
 		}
-		sessionManager.appendThinkingLevelChange(thinkingLevel);
-	}
-	if (!hasServiceTierEntry) {
-		sessionManager.appendServiceTierChange(serviceTierPreference);
-	}
 
-	const session = new AgentSession({
-		agent,
-		sessionManager,
-		settingsManager,
-		serviceTierPreference,
-		cwd,
-		// Only the explicit dir — the default may not match injected custom storage.
-		agentDir: options.agentDir,
-		scopedModels: options.scopedModels,
-		resourceLoader,
-		customTools: options.customTools,
-		modelRegistry,
-		mcpManager,
-		initialActiveToolNames,
-		allowedToolNames,
-		includeGoals,
-		includeCompactSkill: options.includeCompactSkill,
-		rlmHeartbeatController: options.rlmHeartbeatController,
-		agentMessageController: options.agentMessageController,
-		agentObserveController: options.agentObserveController,
-		extensionRunnerRef,
-		rlmDepth: options.rlmDepth,
-		rlmMaxDepth: options.rlmMaxDepth,
-		rlmSessionDir: options.rlmSessionDir,
-		rlmParentNodeId: options.rlmParentNodeId,
-		rlmParentAgent: options.rlmParentAgent,
-		subagentRuntimeHost: options.subagentRuntimeHost,
-		sessionStartEvent: options.sessionStartEvent,
-		prewarmIpythonKernel: options.prewarmIpythonKernel,
-		autonomous: options.autonomous,
-		serializedRefine: options.serializedRefine,
-		initialGoal: options.initialGoal,
-	});
-	const extensionsResult = resourceLoader.getExtensions();
-
-	return {
-		session,
-		extensionsResult,
-		modelFallbackMessage,
-	};
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			serviceTierPreference,
+			cwd,
+			// Only the explicit dir — the default may not match injected custom storage.
+			agentDir: options.agentDir,
+			scopedModels: options.scopedModels,
+			resourceLoader,
+			customTools: options.customTools,
+			modelRegistry,
+			mcpManager,
+			initialActiveToolNames,
+			allowedToolNames,
+			includeGoals,
+			includeCompactSkill: contextEditingController ? false : options.includeCompactSkill,
+			contextEditingController,
+			contextEditingBudget,
+			contextEditingServingConfig: contextEditingSglang
+				? {
+						baseUrl: contextEditingSglang.baseUrl,
+						model: contextEditingSglang.model,
+						mode: contextEditingSglang.mode,
+						servingFingerprint: contextEditingSglang.servingFingerprint,
+					}
+				: undefined,
+			rlmHeartbeatController: options.rlmHeartbeatController,
+			agentMessageController: options.agentMessageController,
+			agentObserveController: options.agentObserveController,
+			extensionRunnerRef,
+			rlmDepth: options.rlmDepth,
+			rlmMaxDepth: options.rlmMaxDepth,
+			rlmSessionDir: options.rlmSessionDir,
+			rlmParentNodeId: options.rlmParentNodeId,
+			rlmParentAgent: options.rlmParentAgent,
+			subagentRuntimeHost: options.subagentRuntimeHost,
+			sessionStartEvent: options.sessionStartEvent,
+			prewarmIpythonKernel: options.prewarmIpythonKernel,
+			autonomous: options.autonomous,
+			serializedRefine: options.serializedRefine,
+			initialGoal: options.initialGoal,
+		});
+	} catch (error) {
+		contextEditingController?.close();
+		throw error;
+	}
+	try {
+		const extensionsResult = resourceLoader.getExtensions();
+		return {
+			session,
+			extensionsResult,
+			modelFallbackMessage,
+		};
+	} catch (error) {
+		await session.disposeAsync();
+		throw error;
+	}
 }

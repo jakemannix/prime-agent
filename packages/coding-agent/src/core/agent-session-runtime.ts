@@ -333,6 +333,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	async createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime> {
+		if (options.parentSession.contextEditingEnabled) {
+			throw new Error("RLM subagents are unavailable while context editing is active.");
+		}
 		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
 		if (options.parentSession.sessionFile) {
 			sessionManager.newSession({
@@ -521,6 +524,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 		},
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
+		if (this.session.contextEditingEnabled) {
+			throw new Error("Forking is unavailable while context editing is active.");
+		}
 		const position = options?.position ?? "before";
 		const beforeResult = await this.emitBeforeFork(entryId, { position });
 		if (beforeResult.cancelled) {

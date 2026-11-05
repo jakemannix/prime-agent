@@ -44,6 +44,22 @@ export {
 	serializeConversation,
 	shouldCompact,
 } from "./core/compaction/index.js";
+export {
+	applySglangContextMetadata,
+	type ContextEditConfig,
+	ContextEditingController,
+	ContextEditingError,
+	type ContextEditingStatus,
+	type ContextEditOperation,
+	type ContextEditProposal,
+	type ContextEditReceipt,
+	type RequestSnapshot,
+	type SglangAdapterConfig,
+	type SglangAdapterIdentity,
+	type SglangAdapterMode,
+	type SourceEntry,
+	validateSglangEndpoint,
+} from "./core/context-editing/index.js";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.js";
 // Extension system
 export type {
@@ -159,6 +175,7 @@ export {
 	type AgentSessionRuntimeKind,
 	type AgentSessionRuntimeMetadata,
 	type AgentSessionServices,
+	type ContextEditingSessionOptions,
 	type CreateAgentSessionFromServicesOptions,
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,

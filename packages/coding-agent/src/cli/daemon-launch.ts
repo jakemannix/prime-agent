@@ -23,7 +23,12 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
 } from "../modes/daemon/daemon-worker-protocol.js";
-import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
+import {
+	hasContextEditingCliFlag,
+	isHelpCommandRequest,
+	PUBLIC_COMMAND_NAMES,
+	REMOVED_COMMAND_NAMES,
+} from "./command-registry.js";
 import { createCliSubprocessEnv, formatCurrentCliCommand } from "./subprocess-launch.js";
 
 const DAEMON_STARTUP_TIMEOUT_MS = 30_000;
@@ -534,7 +539,7 @@ function findFirstEarlyLaunchPositional(args: readonly string[]): { index: numbe
 }
 
 export function shouldStartDaemonEarly(args: readonly string[], startupBenchmark: boolean): boolean {
-	if (startupBenchmark) {
+	if (startupBenchmark || hasContextEditingCliFlag(args)) {
 		return false;
 	}
 	const modeIndex = args.indexOf("--mode");

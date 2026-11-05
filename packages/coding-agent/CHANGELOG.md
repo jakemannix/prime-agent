@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added experimental opt-in single-root context editing with validated staged edits, a durable effective view, cache-epoch reset/resume, and explicit SGLang metadata support. Added local Ollama demo and endpoint comparison tooling.
+
 - Changed sent agent messages in the IPython cell UI to show only the message text with a `╰─` gutter when expanded, matching received messages, and hid the raw `agent_message.send` receipt dictionary.
 - Fixed Homebrew installs attempting to self-update their versioned Cellar keg instead of directing users to `brew upgrade prime-agent` ([#844](https://github.com/PrimeIntellect-ai/prime-agent/issues/844))
 

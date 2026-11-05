@@ -13,7 +13,12 @@ import {
 } from "../core/orphan-process-journal.js";
 import { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../modes/rpc/jsonl.js";
-import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
+import {
+	hasContextEditingCliFlag,
+	isHelpCommandRequest,
+	PUBLIC_COMMAND_NAMES,
+	REMOVED_COMMAND_NAMES,
+} from "./command-registry.js";
 import { type CliSubprocessLaunchSpec, createCliSubprocessLaunchSpec } from "./subprocess-launch.js";
 
 const OWNED_WORKER_ENV = "PRIME_AGENT_INTERNAL_OWNED_WORKER";
@@ -67,7 +72,7 @@ export function classifyOwnedSessionWorkerInvocation(
 	stdinIsTTY: boolean | undefined,
 	environment: NodeJS.ProcessEnv = process.env,
 ): OwnedSessionWorkerProfile | undefined {
-	if (isOwnedSessionWorkerProcess(environment) || hasNonSessionOperation(args)) {
+	if (isOwnedSessionWorkerProcess(environment) || hasNonSessionOperation(args) || hasContextEditingCliFlag(args)) {
 		return undefined;
 	}
 

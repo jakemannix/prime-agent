@@ -23,6 +23,7 @@ export {
 	type AgentSessionCreationOptions,
 	type AgentSessionRuntimeDiagnostic,
 	type AgentSessionServices,
+	type ContextEditingSessionOptions,
 	type CreateAgentSessionFromServicesOptions,
 	type CreateAgentSessionServicesOptions,
 	createAgentSessionFromServices,
@@ -30,6 +31,7 @@ export {
 } from "./agent-session-services.js";
 export { type BashExecutorOptions, type BashResult, executeBashWithOperations } from "./bash-executor.js";
 export type { CompactionResult } from "./compaction/index.js";
+export * from "./context-editing/index.js";
 export { createEventBus, type EventBus, type EventBusController } from "./event-bus.js";
 // Extensions system
 export {

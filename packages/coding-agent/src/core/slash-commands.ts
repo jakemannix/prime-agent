@@ -10,7 +10,7 @@ export interface SlashCommandInfo {
 	sourceInfo: SourceInfo;
 }
 
-export const SESSION_SLASH_COMMAND_NAMES = ["compact", "refine", "goal", "autonomous"] as const;
+export const SESSION_SLASH_COMMAND_NAMES = ["compact", "refine", "goal", "autonomous", "context-reset"] as const;
 
 export type SessionSlashCommandName = (typeof SESSION_SLASH_COMMAND_NAMES)[number];
 
@@ -158,6 +158,12 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{
 		name: "refine",
 		description: "Refine continual harness prompt notes, skills, subagents, and memory",
+	},
+	{
+		name: "context-reset",
+		description: "Rotate the active context-editing cache namespace without restoring removed text",
+		argumentHint: "[reason]",
+		takesArgument: true,
 	},
 	{
 		name: "goal",

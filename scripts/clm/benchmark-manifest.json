@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "fixtureSha256": "d66af595c24fd033478b693a5482345fe2f5e33d9a896921b8911e3c2f054b58",
+  "servingFingerprint": "18467467f7b3b7f9e1cb344fa23b035914852a8d86f09b6099ea298ef25fe7f7",
+  "model": {
+    "id": "qwen36-27b",
+    "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
+  },
+  "tokenizer": {
+    "id": "Qwen/Qwen3.6-27B",
+    "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+    "chatTemplateRevision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
+  },
+  "software": {
+    "sglangVersion": "0.5.16",
+    "scrPatchRevision": "18dc11115f50f261233c5bba7937834491e307e8"
+  },
+  "serving": {
+    "contextLength": 65536,
+    "tensorParallel": 1,
+    "dtype": "bfloat16",
+    "cudaGraph": false
+  },
+  "scr": {
+    "sideSessions": 1,
+    "sideTokens": 40960,
+    "maxBlocks": 6,
+    "ssmMode": "fork"
+  },
+  "generation": {
+    "temperature": 0,
+    "topP": 1,
+    "seed": 0,
+    "stream": true
+  },
+  "limits": {
+    "requestTimeoutMs": 120000,
+    "maxInputTokens": 28672,
+    "maxOutputTokens": 8192,
+    "maxResponseBytes": 1048576,
+    "maxSerializedRequestBytes": 1048576
+  }
+}

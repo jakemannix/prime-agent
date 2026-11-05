@@ -7,6 +7,7 @@ import type { AgentObserveController } from "./agent-observe.js";
 import { installAgentTraceUpload } from "./agent-traces.js";
 import { AuthStorage } from "./auth-storage.js";
 import type { AgentAutonomousConfig } from "./autonomous.js";
+import type { SglangAdapterConfig } from "./context-editing/sglang-adapter.js";
 import type { AgentRlmHeartbeatController } from "./cron-jobs.js";
 import { createHerdrAgentStateExtension } from "./extensions/builtin/herdr-agent-state.js";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
@@ -54,8 +55,23 @@ export interface CreateAgentSessionServicesOptions {
 	noBuiltinHerdrReporter?: boolean;
 }
 
+export interface ContextEditingSessionOptions {
+	/** Durable controller directory. Defaults to a directory beside the persisted session file. */
+	directory?: string;
+	/** Total prompt budget, including fixed overhead and output reserve. Defaults to the selected model context window. */
+	maxPromptTokens?: number;
+	/** Conservative fixed system prompt, tool schema, and chat-template overhead. */
+	fixedPromptTokens?: number;
+	/** Output headroom. Defaults to the selected model maximum output. */
+	maxOutputTokens?: number;
+	/** Optional explicit SGLang metadata adapter. No endpoint capability is inferred. */
+	sglang?: SglangAdapterConfig & { model: string };
+}
+
 export interface AgentSessionCreationOptions {
 	model?: Model<any>;
+	/** Opt-in durable single-root context editing. Disabled when omitted. */
+	contextEditing?: ContextEditingSessionOptions;
 	thinkingLevel?: ThinkingLevel;
 	/** Provider service tier. Fast mode uses "priority". */
 	serviceTier?: ServiceTier;
@@ -258,6 +274,7 @@ export async function createAgentSessionFromServices(
 		mcpManager: options.services.mcpManager,
 		sessionManager: options.sessionManager,
 		model: options.model,
+		contextEditing: options.contextEditing,
 		thinkingLevel: options.thinkingLevel,
 		serviceTier: options.serviceTier,
 		scopedModels: options.scopedModels,

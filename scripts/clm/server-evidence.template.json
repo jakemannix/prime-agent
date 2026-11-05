@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "status": "UNVERIFIED_TEMPLATE",
+  "recordedAt": null,
+  "mode": null,
+  "endpoint": null,
+  "manifestSha256": null,
+  "servingFingerprint": null,
+  "environment": {
+    "pythonExecutable": null,
+    "pythonVersion": null,
+    "sglangDistributionVersion": null,
+    "sglangSourceCommit": null,
+    "scrCheckoutCommit": null,
+    "gpuAndDriverInfo": null
+  },
+  "loadedConfiguration": {
+    "modelRevision": null,
+    "tokenizerRevision": null,
+    "chatTemplateSha256": null,
+    "dtype": null,
+    "tensorParallel": null,
+    "contextLength": null,
+    "scrOverlayEnabled": null
+  },
+  "evidenceFiles": {
+    "launchCommand": null,
+    "startupLog": null,
+    "gpuMeasurement": null,
+    "prefixTokenCounts": null,
+    "scrRelocationPlans": null
+  },
+  "notes": [
+    "Record separate evidence for exact and SCR processes.",
+    "Copy actual observed values, not just desired manifest fields.",
+    "The client does not verify this sidecar or upgrade its evidence flags.",
+    "Do not include credentials."
+  ]
+}

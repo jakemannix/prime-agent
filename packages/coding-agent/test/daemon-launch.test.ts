@@ -212,6 +212,11 @@ describe("shouldStartDaemonEarly", () => {
 
 	it.each([
 		["daemon process", ["--mode", "daemon"]],
+		["context editing", ["--context-editing", "--print", "hello"]],
+		["context editing via directory", ["--context-editing-dir", "/tmp/context", "--print", "hello"]],
+		["context editing via max prompt", ["--context-editing-max-prompt-tokens", "4096", "--print", "hello"]],
+		["context editing via fixed prompt", ["--context-editing-fixed-prompt-tokens", "512", "--print", "hello"]],
+		["context editing via max output", ["--context-editing-max-output-tokens", "64", "--print", "hello"]],
 		["help", ["--help"]],
 		["version", ["--version"]],
 		["model listing", ["--list-models"]],

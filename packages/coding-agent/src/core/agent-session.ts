@@ -14,7 +14,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -115,6 +115,13 @@ import {
 	shouldCompact,
 } from "./compaction/index.js";
 import {
+	type ContextEditingController,
+	type ContextEditingStatus,
+	canonicalJson,
+	type RequestSnapshot,
+	type SourceEntry,
+} from "./context-editing/index.js";
+import {
 	type ContextTreeNode,
 	type ContextWindowResolver,
 	computeOwnAndTotalUsage,
@@ -174,10 +181,13 @@ import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
 	type BashExecutionMessage,
+	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CompactionOutcome,
 	type CompactionOutcomeReason,
 	type CustomMessage,
+	convertToLlm,
 	createCompactionOutcomeMessage,
+	createCustomMessage,
 	createHeartbeatPromptMessage,
 	createRlmChildFailureMessage,
 	createRlmChildTerminalNoticeMessage,
@@ -187,6 +197,8 @@ import {
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
+	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
+	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
@@ -255,6 +267,7 @@ import {
 } from "./session-manager.js";
 import type { SessionStats } from "./session-stats.js";
 import type { SettingsManager } from "./settings-manager.js";
+import { setContextEditingSideQuestionGuard } from "./side-question.js";
 import { getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 import {
 	parseRefineCommandOptions,
@@ -457,6 +470,14 @@ export interface AgentSessionConfig {
 	baseToolsOverride?: Record<string, AgentTool>;
 	/** Mutable ref used by Agent to access the current ExtensionRunner */
 	extensionRunnerRef?: { current?: ExtensionRunner };
+	/** Mandatory fail-closed context controller for the opt-in single-root mode. */
+	contextEditingController?: ContextEditingController;
+	contextEditingBudget?: {
+		maxPromptTokens: number;
+		fixedPromptTokens: number;
+		maxOutputTokens: number;
+	};
+	contextEditingServingConfig?: unknown;
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
 	/** Current RLM recursion depth. Root sessions default to RLM_DEPTH or 0. */
@@ -1097,6 +1118,7 @@ export class AgentSession {
 		followUps: [],
 	};
 	private _agentEventQueue: Promise<void> = Promise.resolve();
+	private _contextEditingPersistenceFailure?: { error: unknown };
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
 	private readonly _actionStore = new ActionStore<QueuedSessionAction>();
@@ -1173,6 +1195,11 @@ export class AgentSession {
 	private _cwd: string;
 	private _agentDir?: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
+	private readonly _contextEditingController?: ContextEditingController;
+	private readonly _contextEditingBudget?: AgentSessionConfig["contextEditingBudget"];
+	private readonly _contextEditingServingConfig?: unknown;
+	private _latestContextEditingSnapshot?: RequestSnapshot;
+	private readonly _reportedContextEditingReceiptIds = new Set<string>();
 	private _initialActiveToolNames?: string[];
 	private _allowedToolNames?: Set<string>;
 	private _includeGoals: boolean;
@@ -1293,6 +1320,9 @@ export class AgentSession {
 		this._agentDir = config.agentDir;
 		this._modelRegistry = config.modelRegistry;
 		this._extensionRunnerRef = config.extensionRunnerRef;
+		this._contextEditingController = config.contextEditingController;
+		this._contextEditingBudget = config.contextEditingBudget;
+		this._contextEditingServingConfig = config.contextEditingServingConfig;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
 		this._includeGoals = config.includeGoals ?? true;
@@ -1350,6 +1380,13 @@ export class AgentSession {
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
+		if (this._contextEditingController) {
+			setContextEditingSideQuestionGuard(this.agent, true);
+			this.registerDisposeCallback(() => {
+				setContextEditingSideQuestionGuard(this.agent, false);
+				this._contextEditingController?.close();
+			});
+		}
 		this._installAgentToolHooks();
 		this._installAgentTurnHook();
 		this._installAgentContinuationHook();
@@ -1538,6 +1575,21 @@ export class AgentSession {
 		}
 	}
 
+	private _captureContextEditingPersistenceFailure(error: unknown): void {
+		if (this._contextEditingController && !this._contextEditingPersistenceFailure) {
+			this._contextEditingPersistenceFailure = { error };
+		}
+	}
+
+	private _throwIfContextEditingPersistenceFailed(): void {
+		const failure = this._contextEditingPersistenceFailure;
+		if (failure) {
+			throw new Error("Context editing blocked because durable session persistence failed.", {
+				cause: failure.error,
+			});
+		}
+	}
+
 	private _recordLateIpythonSentAgentMessage(toolCallId: string, message: KernelSentAgentMessage): void {
 		const record = () => {
 			if (this._disposed || !this._rememberLateIpythonSentAgentMessage(toolCallId, message)) {
@@ -1546,7 +1598,13 @@ export class AgentSession {
 			this.sessionManager.appendCustomEntry(IPYTHON_SENT_AGENT_MESSAGE_CUSTOM_ENTRY, { toolCallId, message });
 			this._emit({ type: "ipython_sent_agent_message", toolCallId, message });
 		};
-		this._agentEventQueue = this._agentEventQueue.then(record, record);
+		const pendingRecord = this._agentEventQueue.then(record, record);
+		this._agentEventQueue = this._contextEditingController
+			? pendingRecord.catch((error) => {
+					this._captureContextEditingPersistenceFailure(error);
+					throw error;
+				})
+			: pendingRecord;
 		this._agentEventQueue.catch(() => {});
 	}
 
@@ -2198,6 +2256,7 @@ export class AgentSession {
 	}
 
 	private async _shouldStopForThresholdCompaction(context: ShouldStopAfterTurnContext): Promise<boolean> {
+		if (this._contextEditingController) return false;
 		this._continueAfterThresholdCompaction = false;
 		if (this._pendingRequestedCompaction === undefined && !(await this._thresholdCompactionNeeded(context))) {
 			return false;
@@ -2844,6 +2903,9 @@ export class AgentSession {
 	 * it; _checkCompaction consumes the request at the turn boundary.
 	 */
 	handleCompactHostRequest(type: string, payload: Record<string, unknown> = {}): Record<string, unknown> {
+		if (this._contextEditingController) {
+			throw new Error("Native compaction is unavailable while context editing is active.");
+		}
 		if (!this._includeCompactSkill) {
 			throw new Error("the compact skill is disabled in this session");
 		}
@@ -2899,6 +2961,9 @@ export class AgentSession {
 	 * if refine() awaited agent idle from within the active tool call.
 	 */
 	handleRefineHostRequest(type: string, payload: Record<string, unknown> = {}): Record<string, unknown> {
+		if (this._contextEditingController) {
+			throw new Error("Continual-harness refinement is unavailable while context editing is active.");
+		}
 		switch (type) {
 			case "refine.status": {
 				return {
@@ -3362,10 +3427,16 @@ export class AgentSession {
 				}
 			}
 		}
-		this._agentEventQueue = this._agentEventQueue.then(
+		const pendingEvent = this._agentEventQueue.then(
 			() => this._processAgentEvent(event),
 			() => this._processAgentEvent(event),
 		);
+		this._agentEventQueue = this._contextEditingController
+			? pendingEvent.catch((error) => {
+					this._captureContextEditingPersistenceFailure(error);
+					throw error;
+				})
+			: pendingEvent;
 		this._agentEventQueue.catch(() => {});
 	};
 
@@ -4076,6 +4147,165 @@ export class AgentSession {
 		return this._toolDefinitions.get(name)?.definition;
 	}
 
+	/** Whether the fail-closed single-root context editing mode is active. */
+	get contextEditingEnabled(): boolean {
+		return this._contextEditingController !== undefined;
+	}
+
+	getContextEditingStatus(): ContextEditingStatus | undefined {
+		return this._contextEditingController?.status;
+	}
+
+	private _contextEditingServingState(): { fingerprint: string; fixedPromptTokens: number } {
+		const model = this.model;
+		const tools = this.agent.state.tools.map((tool) => ({
+			name: tool.name,
+			description: tool.description,
+			parameters: tool.parameters,
+		}));
+		const serialized = canonicalJson({
+			model: model
+				? {
+						api: model.api,
+						provider: model.provider,
+						id: model.id,
+						baseUrl: model.baseUrl,
+						contextWindow: model.contextWindow,
+						maxTokens: model.maxTokens,
+						reasoning: model.reasoning,
+						compat: model.compat,
+					}
+				: null,
+			thinkingLevel: this.thinkingLevel,
+			serviceTier: this.serviceTier,
+			transport: this.settingsManager.getTransport(),
+			thinkingBudgets: this.settingsManager.getThinkingBudgets(),
+			blockImages: this.settingsManager.getBlockImages(),
+			providerContextEditing: this._contextEditingServingConfig,
+			systemPrompt: this.agent.state.systemPrompt,
+			tools,
+		});
+		return {
+			fingerprint: createHash("sha256").update(serialized).digest("hex"),
+			// One token per UTF-8 byte plus fixed chat-template envelope headroom is deliberately conservative.
+			fixedPromptTokens: Math.max(
+				this._contextEditingBudget?.fixedPromptTokens ?? 0,
+				Buffer.byteLength(serialized, "utf8") + 512,
+			),
+		};
+	}
+
+	private _contextEditingSourceEntries(): SourceEntry[] {
+		const source: SourceEntry[] = [];
+		const appendConverted = (id: string, message: AgentMessage): void => {
+			const converted = convertToLlm([message])[0];
+			if (converted) {
+				// Match the durable JSON representation exactly: omit undefined fields and detach mutable provider objects.
+				source.push({ id, message: JSON.parse(JSON.stringify(converted)) as AgentMessage });
+			}
+		};
+		for (const entry of this.sessionManager.getBranch()) {
+			if (entry.type === "compaction" || entry.type === "branch_summary") {
+				throw new Error("Context editing does not support native compaction or branch-summary history.");
+			}
+			if (entry.type === "message") {
+				appendConverted(entry.id, entry.message);
+			} else if (entry.type === "custom_message") {
+				if (
+					entry.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE ||
+					entry.customType === SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE ||
+					entry.customType === COMPACTION_OUTCOME_CUSTOM_TYPE
+				) {
+					continue;
+				}
+				appendConverted(
+					entry.id,
+					createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
+				);
+			}
+		}
+		return source;
+	}
+
+	/**
+	 * Await the current event/persistence queue, then compile one immutable request snapshot.
+	 * This method is called inline by Agent.transformContext, never from the queued event handler.
+	 */
+	async prepareContextEditingRequest(): Promise<RequestSnapshot> {
+		const controller = this._contextEditingController;
+		if (!controller) {
+			throw new Error("Context editing is not enabled for this session.");
+		}
+		if (this._extensionRunner.hasHandlers("context")) {
+			throw new Error("Context extension handlers are incompatible with fail-closed context editing.");
+		}
+		this._throwIfContextEditingPersistenceFailed();
+		const persistenceBarrier = this._agentEventQueue;
+		try {
+			await persistenceBarrier;
+		} catch (error) {
+			this._captureContextEditingPersistenceFailure(error);
+			this._throwIfContextEditingPersistenceFailed();
+			throw error;
+		}
+		this._throwIfContextEditingPersistenceFailed();
+		try {
+			// SessionManager normally defers a user-only journal until the first assistant; request dispatch cannot.
+			this.sessionManager.flushNow();
+		} catch (error) {
+			this._captureContextEditingPersistenceFailure(error);
+			this._throwIfContextEditingPersistenceFailed();
+			throw error;
+		}
+		const serving = this._contextEditingServingState();
+		const snapshot = controller.prepare(this._contextEditingSourceEntries(), {
+			fixedPromptTokens: serving.fixedPromptTokens,
+			maxPromptTokens: this._contextEditingBudget?.maxPromptTokens,
+			maxOutputTokens: this._contextEditingBudget?.maxOutputTokens,
+			servingFingerprint: serving.fingerprint,
+		});
+		this._latestContextEditingSnapshot = snapshot;
+		const receipt = controller.status.stagingReceipt;
+		if (
+			receipt &&
+			(!receipt.accepted || receipt.phase === "rejected") &&
+			!this._reportedContextEditingReceiptIds.has(receipt.id)
+		) {
+			this._reportedContextEditingReceiptIds.add(receipt.id);
+			throw new Error(
+				`Context edit proposal rejected (${receipt.id}): ${receipt.error ?? "invalid proposal"}. The last-good context was retained; the next clean request may continue.`,
+			);
+		}
+		return snapshot;
+	}
+
+	/** Rotate the cache namespace without restoring removed source text. */
+	async hardResetContextEditing(reason?: string): Promise<RequestSnapshot> {
+		const controller = this._contextEditingController;
+		if (!controller) {
+			throw new Error("Context editing is not enabled for this session.");
+		}
+		if (this.isStreaming) {
+			throw new Error(
+				`Cannot hard reset during an active turn. Stage { "hardReset": true } in ${controller.stagingPath} instead.`,
+			);
+		}
+		this._throwIfContextEditingPersistenceFailed();
+		const persistenceBarrier = this._agentEventQueue;
+		try {
+			await persistenceBarrier;
+		} catch (error) {
+			this._captureContextEditingPersistenceFailure(error);
+			this._throwIfContextEditingPersistenceFailed();
+			throw error;
+		}
+		this._throwIfContextEditingPersistenceFailed();
+		const serving = this._contextEditingServingState();
+		const snapshot = controller.hardReset(reason, serving.fingerprint);
+		this._latestContextEditingSnapshot = snapshot;
+		return snapshot;
+	}
+
 	/**
 	 * Set active tools by name.
 	 * Only tools in the registry can be enabled. Unknown tool names are ignored.
@@ -4083,6 +4313,9 @@ export class AgentSession {
 	 * Changes take effect on the next agent turn.
 	 */
 	setActiveToolsByName(toolNames: string[]): void {
+		if (this._contextEditingController && this._ipythonRuntimeBuilt) {
+			throw new Error("Tool changes are unavailable while context editing is active.");
+		}
 		const tools: AgentTool[] = [];
 		const validToolNames: string[] = [];
 		const seenToolNames = new Set<string>();
@@ -4267,8 +4500,17 @@ export class AgentSession {
 
 		const loaderSystemPrompt = this._resourceLoader.getSystemPrompt();
 		const loaderAppendSystemPrompt = this._resourceLoader.getAppendSystemPrompt();
-		const appendSystemPrompt =
-			loaderAppendSystemPrompt.length > 0 ? loaderAppendSystemPrompt.join("\n\n") : undefined;
+		const contextEditingPrompt = this._contextEditingController
+			? [
+					"Context editing is active in single-root mode.",
+					`Read the exact proposal schema and immutable-generation navigation guide at ${this._contextEditingController.status.protocolPath}.`,
+					`Write proposals only to ${this._contextEditingController.stagingPath}; treat the source journal, state, manifest, snapshots, and receipts as read-only.`,
+					"Edits commit only at the next model-request boundary. Set hardReset to true in a valid proposal to rotate the cache namespace without restoring removed text.",
+					"RLM children, side questions, native compaction, continual-harness refinement, forks, and tree navigation are unavailable in this mode.",
+				].join(" ")
+			: undefined;
+		const appendSections = [...loaderAppendSystemPrompt, ...(contextEditingPrompt ? [contextEditingPrompt] : [])];
+		const appendSystemPrompt = appendSections.length > 0 ? appendSections.join("\n\n") : undefined;
 		const loadedSkills = this._modelVisibleSkills();
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
 
@@ -4282,7 +4524,7 @@ export class AgentSession {
 			selectedTools: validToolNames,
 			toolSnippets,
 			promptGuidelines,
-			allowRecursion: this._rlmDepth < this._rlmMaxDepth,
+			allowRecursion: !this._contextEditingController && this._rlmDepth < this._rlmMaxDepth,
 			rlmDepth: this._rlmDepth,
 			rlmParentAgent: this._rlmParentAgent,
 			harnessState: this._loadMergedHarnessState(),
@@ -5800,6 +6042,11 @@ export class AgentSession {
 					resultText = `Refined continual harness state: ${applied} edit${applied === 1 ? "" : "s"} applied.`;
 					break;
 				}
+				case "context-reset": {
+					const snapshot = await this.hardResetContextEditing(input.command.args || undefined);
+					resultText = `Context cache namespace reset at revision ${snapshot.revision}.`;
+					break;
+				}
 				case "goal":
 					await this._handleGoalSlashCommand(input.text, input.images);
 					resultText = this._goalState.objective
@@ -6589,6 +6836,9 @@ export class AgentSession {
 	 * @throws Error if the model is not available
 	 */
 	async setModel(model: Model<any>, options: ModelSelectOptions = {}): Promise<void> {
+		if (this._contextEditingController) {
+			throw new Error("Model changes are unavailable while context editing is active.");
+		}
 		if (!this._modelRegistry.hasConfiguredAuth(model)) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
@@ -6647,6 +6897,9 @@ export class AgentSession {
 		direction: "forward" | "backward" = "forward",
 		options: ModelSelectOptions = {},
 	): Promise<ModelCycleResult | undefined> {
+		if (this._contextEditingController) {
+			throw new Error("Model changes are unavailable while context editing is active.");
+		}
 		if (this._scopedModels.length > 0) {
 			return this._cycleScopedModel(direction, options);
 		}
@@ -6756,6 +7009,9 @@ export class AgentSession {
 		// Only persist if actually changing
 		const previousLevel = this.agent.state.thinkingLevel;
 		const isChanging = effectiveLevel !== previousLevel;
+		if (isChanging && this._contextEditingController) {
+			throw new Error("Thinking-level changes are unavailable while context editing is active.");
+		}
 
 		this.agent.state.thinkingLevel = effectiveLevel;
 
@@ -6979,6 +7235,11 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string, options: { skipAbort?: boolean } = {}): Promise<CompactionResult> {
+		if (this._contextEditingController) {
+			throw new Error(
+				"Native compaction is unavailable while context editing is active; edit the effective context instead.",
+			);
+		}
 		if (options.skipAbort && this.isStreaming) {
 			throw new Error("Cannot compact without aborting while the agent is running.");
 		}
@@ -7170,7 +7431,7 @@ export class AgentSession {
 	}
 
 	private _autoRefineAllowedForSession(): boolean {
-		return this._rlmDepth === 0 && this._localHarnessStateDir() !== undefined;
+		return !this._contextEditingController && this._rlmDepth === 0 && this._localHarnessStateDir() !== undefined;
 	}
 
 	private _cancelPostCompactionContinue(): void {
@@ -7576,6 +7837,9 @@ export class AgentSession {
 		} = {},
 		internal: { skipAbort?: boolean } = {},
 	): Promise<RefinementResult> {
+		if (this._contextEditingController) {
+			throw new Error("Continual-harness refinement is unavailable while context editing is active.");
+		}
 		// Queued /refine executes from the session-input pump between turns;
 		// refine never aborts the agent (planning is backgrounded and the apply
 		// phase waits for quiescence), so skipAbort only asserts the pump's
@@ -7910,6 +8174,7 @@ export class AgentSession {
 		skipAbortedCheck = true,
 		queueAutonomousContinuation = true,
 	): Promise<boolean> {
+		if (this._contextEditingController) return false;
 		// An abort drops any compaction the model requested this turn, even on the
 		// pre-prompt path (skipAbortedCheck=false) which continues to threshold checks.
 		if (assistantMessage.stopReason === "aborted") {
@@ -8763,6 +9028,9 @@ export class AgentSession {
 	}
 
 	async reload(): Promise<void> {
+		if (this._contextEditingController) {
+			throw new Error("Reload is unavailable while context editing is active.");
+		}
 		const previousFlagValues = this._extensionRunner.getFlagValues();
 		await emitSessionShutdownEvent(this._extensionRunner, {
 			type: "session_shutdown",
@@ -9586,6 +9854,9 @@ export class AgentSession {
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
+		if (this._contextEditingController) {
+			throw new Error("RLM subagents are unavailable while context editing is active.");
+		}
 		const { name: rawName, model: rawModel, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
@@ -10609,6 +10880,9 @@ export class AgentSession {
 		aborted?: boolean;
 		summaryEntry?: BranchSummaryEntry;
 	}> {
+		if (this._contextEditingController) {
+			throw new Error("Tree navigation is unavailable while context editing is active.");
+		}
 		const previous = this._branchNavigationQueue;
 		let release = () => {};
 		this._branchNavigationQueue = new Promise<void>((resolve) => {
@@ -10952,6 +11226,15 @@ export class AgentSession {
 
 		const contextWindow = model.contextWindow ?? 0;
 		if (contextWindow <= 0) return undefined;
+		if (this._contextEditingController) {
+			const snapshot = this._latestContextEditingSnapshot;
+			if (!snapshot) return { tokens: null, contextWindow, percent: null };
+			return {
+				tokens: snapshot.estimatedTokens,
+				contextWindow,
+				percent: (snapshot.estimatedTokens / contextWindow) * 100,
+			};
+		}
 
 		// After compaction, the last assistant usage reflects pre-compaction context size.
 		// We can only trust usage from an assistant that responded after the latest compaction.

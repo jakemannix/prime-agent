@@ -11,6 +11,15 @@ describe("owned session worker CLI routing", () => {
 	it("leaves resident interactive and non-session operations in the frontend", () => {
 		expect(classifyOwnedSessionWorkerInvocation([], true, {})).toBeUndefined();
 		expect(classifyOwnedSessionWorkerInvocation(["--mode", "daemon"], false, {})).toBeUndefined();
+		for (const contextArgs of [
+			["--context-editing"],
+			["--context-editing-dir", "/tmp/context"],
+			["--context-editing-max-prompt-tokens", "4096"],
+			["--context-editing-fixed-prompt-tokens", "512"],
+			["--context-editing-max-output-tokens", "64"],
+		]) {
+			expect(classifyOwnedSessionWorkerInvocation([...contextArgs, "--print", "hello"], false, {})).toBeUndefined();
+		}
 		expect(classifyOwnedSessionWorkerInvocation(["--help"], false, {})).toBeUndefined();
 		expect(classifyOwnedSessionWorkerInvocation(["--version"], false, {})).toBeUndefined();
 		expect(classifyOwnedSessionWorkerInvocation(["--list-models"], false, {})).toBeUndefined();

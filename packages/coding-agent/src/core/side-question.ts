@@ -24,6 +24,13 @@ export interface SideQuestionRun {
 const SIDE_QUESTION_INSTRUCTION =
 	"Answer this side question using only the conversation context above. Do not use tools. The user may send follow-up side questions; none of this side conversation is added to the main session.";
 
+const contextEditingAgents = new WeakSet<Agent>();
+
+export function setContextEditingSideQuestionGuard(agent: Agent, enabled: boolean): void {
+	if (enabled) contextEditingAgents.add(agent);
+	else contextEditingAgents.delete(agent);
+}
+
 function sideQuestionPrompt(question: string, isFirstTurn: boolean): string {
 	const body = isFirstTurn ? `${SIDE_QUESTION_INSTRUCTION}\n\n${question}` : question;
 	return `<side_question>\n${body}\n</side_question>`;
@@ -46,6 +53,9 @@ export function startSideQuestion(
 	onEvent: (event: SideQuestionEvent) => void | Promise<void>,
 	previousTurns: SideQuestionTurn[] = [],
 ): SideQuestionRun {
+	if (contextEditingAgents.has(parent)) {
+		throw new Error("Side questions are unavailable while context editing is active.");
+	}
 	const model = parent.state.model;
 	if (!model) {
 		throw new Error("Select a model before asking a side question");
